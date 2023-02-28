@@ -1,5 +1,5 @@
 /* 
-	对FreeRTOS中动态任务创建中的xTaskCreate()和vTaskDelete()内部实现进行详解
+	对FreeRTOS中动态任务创建中的xTaskCreate()、vTaskDelete()、vTaskSuspend()、vTaskResume()内部实现进行详解。
 */	
 
 /*
