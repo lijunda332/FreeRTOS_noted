@@ -219,3 +219,167 @@
                 mtCOVERAGE_TEST_MARKER();
             }
         }
+
+	 
+/*
+	xTaskSuspen内部实现步骤：
+		1.根据任务句柄获取任务控制块，如果任务句柄为NULL，表示挂起任务自身
+		2.将要挂起的任务从相应的状态列表和事件中移除
+		3.将待挂起任务的任务状态列表插入到挂起态任务列表末尾
+		4.判断任务调度器是否运行，在运行更新下一次阻塞时间，防止被挂起任务为下一次阻塞超时的任务
+		5.如果挂起的是任务自身，且调度器正在运行，需要进行一次任务切换，
+*/ 
+    void vTaskSuspend( TaskHandle_t xTaskToSuspend )
+    {
+        TCB_t * pxTCB;
+
+        taskENTER_CRITICAL();
+        {
+            /* If null is passed in here then it is the running task that is
+             * being suspended. */
+            pxTCB = prvGetTCBFromHandle( xTaskToSuspend );
+
+            traceTASK_SUSPEND( pxTCB );
+
+            /* Remove task from the ready/delayed list and place in the
+             * suspended list. */
+            if( uxListRemove( &( pxTCB->xStateListItem ) ) == ( UBaseType_t ) 0 )
+            {
+                taskRESET_READY_PRIORITY( pxTCB->uxPriority );
+            }
+            else
+            {
+                mtCOVERAGE_TEST_MARKER();
+            }
+
+            /* Is the task waiting on an event also? */
+            if( listLIST_ITEM_CONTAINER( &( pxTCB->xEventListItem ) ) != NULL )
+            {
+                ( void ) uxListRemove( &( pxTCB->xEventListItem ) );
+            }
+            else
+            {
+                mtCOVERAGE_TEST_MARKER();
+            }
+
+            vListInsertEnd( &xSuspendedTaskList, &( pxTCB->xStateListItem ) );
+
+            #if ( configUSE_TASK_NOTIFICATIONS == 1 )
+                {
+                    BaseType_t x;
+
+                    for( x = 0; x < configTASK_NOTIFICATION_ARRAY_ENTRIES; x++ )
+                    {
+                        if( pxTCB->ucNotifyState[ x ] == taskWAITING_NOTIFICATION )
+                        {
+                            /* The task was blocked to wait for a notification, but is
+                             * now suspended, so no notification was received. */
+                            pxTCB->ucNotifyState[ x ] = taskNOT_WAITING_NOTIFICATION;
+                        }
+                    }
+                }
+            #endif /* if ( configUSE_TASK_NOTIFICATIONS == 1 ) */
+        }
+        taskEXIT_CRITICAL();
+
+        if( xSchedulerRunning != pdFALSE )
+        {
+            /* Reset the next expected unblock time in case it referred to the
+             * task that is now in the Suspended state. */
+            taskENTER_CRITICAL();
+            {
+                prvResetNextTaskUnblockTime();
+            }
+            taskEXIT_CRITICAL();
+        }
+        else
+        {
+            mtCOVERAGE_TEST_MARKER();
+        }
+
+        if( pxTCB == pxCurrentTCB )
+        {
+            if( xSchedulerRunning != pdFALSE )
+            {
+                /* The current task has just been suspended. */
+                configASSERT( uxSchedulerSuspended == 0 );
+                portYIELD_WITHIN_API();
+            }
+            else
+            {
+                /* The scheduler is not running, but the task that was pointed
+                 * to by pxCurrentTCB has just been suspended and pxCurrentTCB
+                 * must be adjusted to point to a different task. */
+                if( listCURRENT_LIST_LENGTH( &xSuspendedTaskList ) == uxCurrentNumberOfTasks ) /*lint !e931 Right has no side effect, just volatile. */
+                {
+                    /* No other tasks are ready, so set pxCurrentTCB back to
+                     * NULL so when the next task is created pxCurrentTCB will
+                     * be set to point to it no matter what its relative priority
+                     * is. */
+                    pxCurrentTCB = NULL;
+                }
+                else
+                {
+                    vTaskSwitchContext();
+                }
+            }
+        }
+        else
+        {
+            mtCOVERAGE_TEST_MARKER();
+        }
+    }
+	 
+/*
+	xTaskResume内部实现步骤：
+		1.判断恢复任务是不是正在运行任务
+		2.判断任务是否在挂起列表中，如果在的话就从挂起列表中移除
+		3.判断恢复的任务优先级是否大于当前正在运行的，是的话就切换执行
+*/ 
+    void vTaskResume( TaskHandle_t xTaskToResume )
+    {
+        TCB_t * const pxTCB = xTaskToResume;
+
+        /* It does not make sense to resume the calling task. */
+        configASSERT( xTaskToResume );
+
+        /* The parameter cannot be NULL as it is impossible to resume the
+         * currently executing task. */
+        if( ( pxTCB != pxCurrentTCB ) && ( pxTCB != NULL ) )
+        {
+            taskENTER_CRITICAL();
+            {
+                if( prvTaskIsTaskSuspended( pxTCB ) != pdFALSE )
+                {
+                    traceTASK_RESUME( pxTCB );
+
+                    /* The ready list can be accessed even if the scheduler is
+                     * suspended because this is inside a critical section. */
+                    ( void ) uxListRemove( &( pxTCB->xStateListItem ) );
+                    prvAddTaskToReadyList( pxTCB );
+
+                    /* A higher priority task may have just been resumed. */
+                    if( pxTCB->uxPriority >= pxCurrentTCB->uxPriority )
+                    {
+                        /* This yield may not cause the task just resumed to run,
+                         * but will leave the lists in the correct state for the
+                         * next yield. */
+                        taskYIELD_IF_USING_PREEMPTION();
+                    }
+                    else
+                    {
+                        mtCOVERAGE_TEST_MARKER();
+                    }
+                }
+                else
+                {
+                    mtCOVERAGE_TEST_MARKER();
+                }
+            }
+            taskEXIT_CRITICAL();
+        }
+        else
+        {
+            mtCOVERAGE_TEST_MARKER();
+        }
+    }
