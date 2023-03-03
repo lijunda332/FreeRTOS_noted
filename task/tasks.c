@@ -1,385 +1,239 @@
 /* 
-	对FreeRTOS中动态任务创建中的xTaskCreate()、vTaskDelete()、vTaskSuspend()、vTaskResume()内部实现进行详解。
+	对FreeRTOS中动态任务创建中的xTaskStartScheduler()、xPortStartScheduler()内部实现进行详解。
 */	
 
 /*
-	xTaskCreate内部实现步骤：
-		1.申请堆栈内存
-		2.申请任务控制快内存
-		3.把前面申请的堆栈地址，赋值给控制块的堆栈成员
-		4.调用prvInitialiseNewTask初始化任务块的堆栈成员
-			4.1记录栈顶，保存在pxTopofStack
-			4.2保存任务名字到pxNewTCB->pcTaskName[ x ]中
-			4.3保存任务优先级到pxNewTCB->uxPriority
-			4.5设置状态列表项的所属控制块，设置事件列表项的值
-			4.6列表项的插入是从小到大插入，所以这里将越高优先级的任务他的事件列表项值设置越小，这样就可以拍到前面
-			4.7调用pxPortInitialiseStack初始化任务堆栈，用于保存当前任务上下文寄存器信息，已备后续任务切换使用
-			4.8将任务句柄等于任务控制块
-		5.调用prvAddNewTaskReadyList添加新创建任务到就绪列表中
-			5.1记录任务数量uxCurrentNumberOfTasks++
-			5.2判断新创建的任务是否为第一个任务 -5.2.1 如果创建的是第一个任务，初始化任务列表prvInitialiseTaskLists
-			                                 -5.2.2 如果创建的不是第一个任务，并且调度器还未开始启动，比较新任务与正在执行的任务优先级大小，
-											 新任务优先级大的话，将当前控制块重新指向新的控制块
-		    5.3将新的任务控制块添加到就绪列表中，使用函数prvAddTaskToReadyList
-			5.4如果调度器已经开始运行，并且新任务的优先级更大的话，进行一次任务切换
+	vTaskStartScheduler（）：用于启动任务调度器，任务调度器启动后，FreeRTOS便会开始进行任务调度。
+	vTaskStartScheduler内部实现步骤：
+		1.创建空闲任务: prvIdleTask
+		2.创建软件定时器任务：xTimerCreateTimerTask
+		3.关中断（在启动第一个任务时开启）
+		4.初始化一些全局变量
+		5.调用函数xPortStartScheduler()
+		
 */
+void vTaskStartScheduler( void )
+{
+    BaseType_t xReturn;
 
-    BaseType_t xTaskCreate( TaskFunction_t pxTaskCode,                   /* 任务函数 */
-                            const char * const pcName,					 /* 任务名字 */
-                            const configSTACK_DEPTH_TYPE usStackDepth,   /* 任务堆栈空间大小 */
-                            void * const pvParameters,                   /* 传给任务函数的参数 */
-                            UBaseType_t uxPriority,                      /* 任务优先级 */
-                            TaskHandle_t * const pxCreatedTask )         /* 任务句柄 */
-    {
-        TCB_t * pxNewTCB;
-        BaseType_t xReturn;
-
-        /* If the stack grows down then allocate the stack then the TCB so the stack
-         * does not grow into the TCB.  Likewise if the stack grows up then allocate
-         * the TCB then the stack. */
-        #if ( portSTACK_GROWTH > 0 )
-            {
-                /* Allocate space for the TCB.  Where the memory comes from depends on
-                 * the implementation of the port malloc function and whether or not static
-                 * allocation is being used. */
-			   
-                pxNewTCB = ( TCB_t * ) pvPortMalloc( sizeof( TCB_t ) );
-
-                if( pxNewTCB != NULL )
-                {
-                    /* Allocate space for the stack used by the task being created.
-                     * The base of the stack memory stored in the TCB so the task can
-                     * be deleted later if required. */
-                    pxNewTCB->pxStack = ( StackType_t * ) pvPortMallocStack( ( ( ( size_t ) usStackDepth ) * sizeof( StackType_t ) ) ); /*lint !e961 MISRA exception as the casts are only redundant for some ports. */
-
-                    if( pxNewTCB->pxStack == NULL )
-                    {
-                        /* Could not allocate the stack.  Delete the allocated TCB. */
-                        vPortFree( pxNewTCB );
-                        pxNewTCB = NULL;
-                    }
-                }
-            }
-        #else /* portSTACK_GROWTH */
-            {
-                StackType_t * pxStack;
-
-                /* Allocate space for the stack used by the task being created. */
-                pxStack = pvPortMallocStack( ( ( ( size_t ) usStackDepth ) * sizeof( StackType_t ) ) ); /*lint !e9079 All values returned by pvPortMalloc() have at least the alignment required by the MCU's stack and this allocation is the stack. */
-
-                if( pxStack != NULL )
-                {
-                    /* Allocate space for the TCB. */
-                    pxNewTCB = ( TCB_t * ) pvPortMalloc( sizeof( TCB_t ) ); /*lint !e9087 !e9079 All values returned by pvPortMalloc() have at least the alignment required by the MCU's stack, and the first member of TCB_t is always a pointer to the task's stack. */
-
-                    if( pxNewTCB != NULL )
-                    {
-                        /* Store the stack location in the TCB. */
-                        pxNewTCB->pxStack = pxStack;
-                    }
-                    else
-                    {
-                        /* The stack cannot be used as the TCB was not created.  Free
-                         * it again. */
-                        vPortFreeStack( pxStack );
-                    }
-                }
-                else
-                {
-                    pxNewTCB = NULL;
-                }
-            }
-        #endif /* portSTACK_GROWTH */
-
-        if( pxNewTCB != NULL )
+    /* Add the idle task at the lowest priority. */
+    #if ( configSUPPORT_STATIC_ALLOCATION == 1 )
         {
-            #if ( tskSTATIC_AND_DYNAMIC_ALLOCATION_POSSIBLE != 0 ) /*lint !e9029 !e731 Macro has been consolidated for readability reasons. */
-                {
-                    /* Tasks can be created statically or dynamically, so note this
-                     * task was created dynamically in case it is later deleted. */
-                    pxNewTCB->ucStaticallyAllocated = tskDYNAMICALLY_ALLOCATED_STACK_AND_TCB;
-                }
-            #endif /* tskSTATIC_AND_DYNAMIC_ALLOCATION_POSSIBLE */
+            StaticTask_t * pxIdleTaskTCBBuffer = NULL;
+            StackType_t * pxIdleTaskStackBuffer = NULL;
+            uint32_t ulIdleTaskStackSize;
 
-            prvInitialiseNewTask( pxTaskCode, pcName, ( uint32_t ) usStackDepth, pvParameters, uxPriority, pxCreatedTask, pxNewTCB, NULL );
-            prvAddNewTaskToReadyList( pxNewTCB );
-            xReturn = pdPASS;
+            /* The Idle task is created using user provided RAM - obtain the
+             * address of the RAM then create the idle task. */
+            vApplicationGetIdleTaskMemory( &pxIdleTaskTCBBuffer, &pxIdleTaskStackBuffer, &ulIdleTaskStackSize );
+            xIdleTaskHandle = xTaskCreateStatic( prvIdleTask,
+                                                 configIDLE_TASK_NAME,
+                                                 ulIdleTaskStackSize,
+                                                 ( void * ) NULL,       /*lint !e961.  The cast is not redundant for all compilers. */
+                                                 portPRIVILEGE_BIT,     /* In effect ( tskIDLE_PRIORITY | portPRIVILEGE_BIT ), but tskIDLE_PRIORITY is zero. */
+                                                 pxIdleTaskStackBuffer,
+                                                 pxIdleTaskTCBBuffer ); /*lint !e961 MISRA exception, justified as it is not a redundant explicit cast to all supported compilers. */
+
+            if( xIdleTaskHandle != NULL )
+            {
+                xReturn = pdPASS;
+            }
+            else
+            {
+                xReturn = pdFAIL;
+            }
+        }
+    #else /* if ( configSUPPORT_STATIC_ALLOCATION == 1 ) */
+        {
+            /* The Idle task is being created using dynamically allocated RAM. */
+            xReturn = xTaskCreate( prvIdleTask,
+                                   configIDLE_TASK_NAME,
+                                   configMINIMAL_STACK_SIZE,
+                                   ( void * ) NULL,
+                                   portPRIVILEGE_BIT,  /* In effect ( tskIDLE_PRIORITY | portPRIVILEGE_BIT ), but tskIDLE_PRIORITY is zero. */
+                                   &xIdleTaskHandle ); /*lint !e961 MISRA exception, justified as it is not a redundant explicit cast to all supported compilers. */
+        }
+    #endif /* configSUPPORT_STATIC_ALLOCATION */
+
+    #if ( configUSE_TIMERS == 1 )
+        {
+            if( xReturn == pdPASS )
+            {
+                xReturn = xTimerCreateTimerTask();
+            }
+            else
+            {
+                mtCOVERAGE_TEST_MARKER();
+            }
+        }
+    #endif /* configUSE_TIMERS */
+
+    if( xReturn == pdPASS )
+    {
+        /* freertos_tasks_c_additions_init() should only be called if the user
+         * definable macro FREERTOS_TASKS_C_ADDITIONS_INIT() is defined, as that is
+         * the only macro called by the function. */
+        #ifdef FREERTOS_TASKS_C_ADDITIONS_INIT
+            {
+                freertos_tasks_c_additions_init();
+            }
+        #endif
+
+        /* Interrupts are turned off here, to ensure a tick does not occur
+         * before or during the call to xPortStartScheduler().  The stacks of
+         * the created tasks contain a status word with interrupts switched on
+         * so interrupts will automatically get re-enabled when the first task
+         * starts to run. */
+        portDISABLE_INTERRUPTS();
+
+        #if ( configUSE_NEWLIB_REENTRANT == 1 )
+            {
+                /* Switch Newlib's _impure_ptr variable to point to the _reent
+                 * structure specific to the task that will run first.
+                 * See the third party link http://www.nadler.com/embedded/newlibAndFreeRTOS.html
+                 * for additional information. */
+                _impure_ptr = &( pxCurrentTCB->xNewLib_reent );
+            }
+        #endif /* configUSE_NEWLIB_REENTRANT */
+
+        xNextTaskUnblockTime = portMAX_DELAY;
+        xSchedulerRunning = pdTRUE;
+        xTickCount = ( TickType_t ) configINITIAL_TICK_COUNT;
+
+        /* If configGENERATE_RUN_TIME_STATS is defined then the following
+         * macro must be defined to configure the timer/counter used to generate
+         * the run time counter time base.   NOTE:  If configGENERATE_RUN_TIME_STATS
+         * is set to 0 and the following line fails to build then ensure you do not
+         * have portCONFIGURE_TIMER_FOR_RUN_TIME_STATS() defined in your
+         * FreeRTOSConfig.h file. */
+        portCONFIGURE_TIMER_FOR_RUN_TIME_STATS();
+
+        traceTASK_SWITCHED_IN();
+
+        /* Setting up the timer tick is hardware specific and thus in the
+         * portable interface. */
+        if( xPortStartScheduler() != pdFALSE )
+        {
+            /* Should not reach here as if the scheduler is running the
+             * function will not return. */
         }
         else
         {
-            xReturn = errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY;
+            /* Should only reach here if a task calls xTaskEndScheduler(). */
         }
-
-        return xReturn;
+    }
+    else
+    {
+        /* This line will only be reached if the kernel could not be started,
+         * because there was not enough FreeRTOS heap to create the idle task
+         * or the timer task. */
+        configASSERT( xReturn != errCOULD_NOT_ALLOCATE_REQUIRED_MEMORY );
     }
 
-/*
-	vTaskDelete()内部实现步骤：
-		1.获取所要删除任务的控制块
-		2.将被删除任务，移除所在列表
-		3.判断所需要删除的任务
-			3.1删除任务自身，需先添加到等待删除列表，内存释放将在空闲任务执行
-			3.2删除其他任务，当前任务数量--
-		4.删除的任务为其他任务则直接释放内存prvDeleteTCB( )
-		5.调度器正在运行且删除任务自身，则需要进行一次任务切换
+    /* Prevent compiler warnings if INCLUDE_xTaskGetIdleTaskHandle is set to 0,
+     * meaning xIdleTaskHandle is not used anywhere else. */
+    ( void ) xIdleTaskHandle;
 
+    /* OpenOCD makes use of uxTopUsedPriority for thread debugging. Prevent uxTopUsedPriority
+     * from getting optimized out as it is no longer used by the kernel. */
+    ( void ) uxTopUsedPriority;
+}
+
+/*
+	vPortStartScheduler():该函数用于完成启动任务调度器中与硬件架构相关的配置部分，以及启动第一个任务
+	vPortStartScheduler内部实现步骤：
+		1.检测用户在FreeRTOSConfig.h文件中对中断的相关配置是否有误
+		2.配置PendSV和SysTick的中断优先级为最低优先级
+		3.调用函数vPortSetupTimerInterrupt()配置SysTick
+		4.初始化临界去嵌套计数器为0
+		5.调用函数prvEnableVFP()使能FPU
+		6.调用函数prvStartFirstTask()启动第一个任务
+		
 */
- void vTaskDelete( TaskHandle_t xTaskToDelete )
-    {
-        TCB_t * pxTCB;
-
-        taskENTER_CRITICAL();
+BaseType_t xPortStartScheduler( void )
+{
+    #if ( configASSERT_DEFINED == 1 )
         {
-            /* If null is passed in here then it is the calling task that is
-             * being deleted. */
-            pxTCB = prvGetTCBFromHandle( xTaskToDelete );
+            volatile uint32_t ulOriginalPriority;
+            volatile uint8_t * const pucFirstUserPriorityRegister = ( uint8_t * ) ( portNVIC_IP_REGISTERS_OFFSET_16 + portFIRST_USER_INTERRUPT_NUMBER );
+            volatile uint8_t ucMaxPriorityValue;
 
-            /* Remove task from the ready/delayed list. */
-            if( uxListRemove( &( pxTCB->xStateListItem ) ) == ( UBaseType_t ) 0 )
+            /* Determine the maximum priority from which ISR safe FreeRTOS API
+             * functions can be called.  ISR safe functions are those that end in
+             * "FromISR".  FreeRTOS maintains separate thread and ISR API functions to
+             * ensure interrupt entry is as fast and simple as possible.
+             *
+             * Save the interrupt priority value that is about to be clobbered. */
+            ulOriginalPriority = *pucFirstUserPriorityRegister;
+
+            /* Determine the number of priority bits available.  First write to all
+             * possible bits. */
+            *pucFirstUserPriorityRegister = portMAX_8_BIT_VALUE;
+
+            /* Read the value back to see how many bits stuck. */
+            ucMaxPriorityValue = *pucFirstUserPriorityRegister;
+
+            /* The kernel interrupt priority should be set to the lowest
+             * priority. */
+            configASSERT( ucMaxPriorityValue == ( configKERNEL_INTERRUPT_PRIORITY & ucMaxPriorityValue ) );
+
+            /* Use the same mask on the maximum system call priority. */
+            ucMaxSysCallPriority = configMAX_SYSCALL_INTERRUPT_PRIORITY & ucMaxPriorityValue;
+
+            /* Calculate the maximum acceptable priority group value for the number
+             * of bits read back. */
+            ulMaxPRIGROUPValue = portMAX_PRIGROUP_BITS;
+
+            while( ( ucMaxPriorityValue & portTOP_BIT_OF_BYTE ) == portTOP_BIT_OF_BYTE )
             {
-                taskRESET_READY_PRIORITY( pxTCB->uxPriority );
-            }
-            else
-            {
-                mtCOVERAGE_TEST_MARKER();
-            }
-
-            /* Is the task waiting on an event also? */
-            if( listLIST_ITEM_CONTAINER( &( pxTCB->xEventListItem ) ) != NULL )
-            {
-                ( void ) uxListRemove( &( pxTCB->xEventListItem ) );
-            }
-            else
-            {
-                mtCOVERAGE_TEST_MARKER();
-            }
-
-            /* Increment the uxTaskNumber also so kernel aware debuggers can
-             * detect that the task lists need re-generating.  This is done before
-             * portPRE_TASK_DELETE_HOOK() as in the Windows port that macro will
-             * not return. */
-            uxTaskNumber++;
-
-            if( pxTCB == pxCurrentTCB )
-            {
-                /* A task is deleting itself.  This cannot complete within the
-                 * task itself, as a context switch to another task is required.
-                 * Place the task in the termination list.  The idle task will
-                 * check the termination list and free up any memory allocated by
-                 * the scheduler for the TCB and stack of the deleted task. */
-                vListInsertEnd( &xTasksWaitingTermination, &( pxTCB->xStateListItem ) );
-
-                /* Increment the ucTasksDeleted variable so the idle task knows
-                 * there is a task that has been deleted and that it should therefore
-                 * check the xTasksWaitingTermination list. */
-                ++uxDeletedTasksWaitingCleanUp;
-
-                /* Call the delete hook before portPRE_TASK_DELETE_HOOK() as
-                 * portPRE_TASK_DELETE_HOOK() does not return in the Win32 port. */
-                traceTASK_DELETE( pxTCB );
-
-                /* The pre-delete hook is primarily for the Windows simulator,
-                 * in which Windows specific clean up operations are performed,
-                 * after which it is not possible to yield away from this task -
-                 * hence xYieldPending is used to latch that a context switch is
-                 * required. */
-                portPRE_TASK_DELETE_HOOK( pxTCB, &xYieldPending );
-            }
-            else
-            {
-                --uxCurrentNumberOfTasks;
-                traceTASK_DELETE( pxTCB );
-
-                /* Reset the next expected unblock time in case it referred to
-                 * the task that has just been deleted. */
-                prvResetNextTaskUnblockTime();
-            }
-        }
-        taskEXIT_CRITICAL();
-
-        /* If the task is not deleting itself, call prvDeleteTCB from outside of
-         * critical section. If a task deletes itself, prvDeleteTCB is called
-         * from prvCheckTasksWaitingTermination which is called from Idle task. */
-        if( pxTCB != pxCurrentTCB )
-        {
-            prvDeleteTCB( pxTCB );
-        }
-
-        /* Force a reschedule if it is the currently running task that has just
-         * been deleted. */
-        if( xSchedulerRunning != pdFALSE )
-        {
-            if( pxTCB == pxCurrentTCB )
-            {
-                configASSERT( uxSchedulerSuspended == 0 );
-                portYIELD_WITHIN_API();
-            }
-            else
-            {
-                mtCOVERAGE_TEST_MARKER();
-            }
-        }
-
-	 
-/*
-	xTaskSuspen内部实现步骤：
-		1.根据任务句柄获取任务控制块，如果任务句柄为NULL，表示挂起任务自身
-		2.将要挂起的任务从相应的状态列表和事件中移除
-		3.将待挂起任务的任务状态列表插入到挂起态任务列表末尾
-		4.判断任务调度器是否运行，在运行更新下一次阻塞时间，防止被挂起任务为下一次阻塞超时的任务
-		5.如果挂起的是任务自身，且调度器正在运行，需要进行一次任务切换，
-*/ 
-    void vTaskSuspend( TaskHandle_t xTaskToSuspend )
-    {
-        TCB_t * pxTCB;
-
-        taskENTER_CRITICAL();
-        {
-            /* If null is passed in here then it is the running task that is
-             * being suspended. */
-            pxTCB = prvGetTCBFromHandle( xTaskToSuspend );
-
-            traceTASK_SUSPEND( pxTCB );
-
-            /* Remove task from the ready/delayed list and place in the
-             * suspended list. */
-            if( uxListRemove( &( pxTCB->xStateListItem ) ) == ( UBaseType_t ) 0 )
-            {
-                taskRESET_READY_PRIORITY( pxTCB->uxPriority );
-            }
-            else
-            {
-                mtCOVERAGE_TEST_MARKER();
+                ulMaxPRIGROUPValue--;
+                ucMaxPriorityValue <<= ( uint8_t ) 0x01;
             }
 
-            /* Is the task waiting on an event also? */
-            if( listLIST_ITEM_CONTAINER( &( pxTCB->xEventListItem ) ) != NULL )
-            {
-                ( void ) uxListRemove( &( pxTCB->xEventListItem ) );
-            }
-            else
-            {
-                mtCOVERAGE_TEST_MARKER();
-            }
-
-            vListInsertEnd( &xSuspendedTaskList, &( pxTCB->xStateListItem ) );
-
-            #if ( configUSE_TASK_NOTIFICATIONS == 1 )
+            #ifdef __NVIC_PRIO_BITS
                 {
-                    BaseType_t x;
-
-                    for( x = 0; x < configTASK_NOTIFICATION_ARRAY_ENTRIES; x++ )
-                    {
-                        if( pxTCB->ucNotifyState[ x ] == taskWAITING_NOTIFICATION )
-                        {
-                            /* The task was blocked to wait for a notification, but is
-                             * now suspended, so no notification was received. */
-                            pxTCB->ucNotifyState[ x ] = taskNOT_WAITING_NOTIFICATION;
-                        }
-                    }
+                    /* Check the CMSIS configuration that defines the number of
+                     * priority bits matches the number of priority bits actually queried
+                     * from the hardware. */
+                    configASSERT( ( portMAX_PRIGROUP_BITS - ulMaxPRIGROUPValue ) == __NVIC_PRIO_BITS );
                 }
-            #endif /* if ( configUSE_TASK_NOTIFICATIONS == 1 ) */
-        }
-        taskEXIT_CRITICAL();
+            #endif
 
-        if( xSchedulerRunning != pdFALSE )
-        {
-            /* Reset the next expected unblock time in case it referred to the
-             * task that is now in the Suspended state. */
-            taskENTER_CRITICAL();
-            {
-                prvResetNextTaskUnblockTime();
-            }
-            taskEXIT_CRITICAL();
-        }
-        else
-        {
-            mtCOVERAGE_TEST_MARKER();
-        }
-
-        if( pxTCB == pxCurrentTCB )
-        {
-            if( xSchedulerRunning != pdFALSE )
-            {
-                /* The current task has just been suspended. */
-                configASSERT( uxSchedulerSuspended == 0 );
-                portYIELD_WITHIN_API();
-            }
-            else
-            {
-                /* The scheduler is not running, but the task that was pointed
-                 * to by pxCurrentTCB has just been suspended and pxCurrentTCB
-                 * must be adjusted to point to a different task. */
-                if( listCURRENT_LIST_LENGTH( &xSuspendedTaskList ) == uxCurrentNumberOfTasks ) /*lint !e931 Right has no side effect, just volatile. */
+            #ifdef configPRIO_BITS
                 {
-                    /* No other tasks are ready, so set pxCurrentTCB back to
-                     * NULL so when the next task is created pxCurrentTCB will
-                     * be set to point to it no matter what its relative priority
-                     * is. */
-                    pxCurrentTCB = NULL;
+                    /* Check the FreeRTOS configuration that defines the number of
+                     * priority bits matches the number of priority bits actually queried
+                     * from the hardware. */
+                    configASSERT( ( portMAX_PRIGROUP_BITS - ulMaxPRIGROUPValue ) == configPRIO_BITS );
                 }
-                else
-                {
-                    vTaskSwitchContext();
-                }
-            }
-        }
-        else
-        {
-            mtCOVERAGE_TEST_MARKER();
-        }
-    }
-	 
-/*
-	xTaskResume内部实现步骤：
-		1.判断恢复任务是不是正在运行任务
-		2.判断任务是否在挂起列表中，如果在的话就从挂起列表中移除
-		3.判断恢复的任务优先级是否大于当前正在运行的，是的话就切换执行
-*/ 
-    void vTaskResume( TaskHandle_t xTaskToResume )
-    {
-        TCB_t * const pxTCB = xTaskToResume;
+            #endif
 
-        /* It does not make sense to resume the calling task. */
-        configASSERT( xTaskToResume );
+            /* Shift the priority group value back to its position within the AIRCR
+             * register. */
+            ulMaxPRIGROUPValue <<= portPRIGROUP_SHIFT;
+            ulMaxPRIGROUPValue &= portPRIORITY_GROUP_MASK;
 
-        /* The parameter cannot be NULL as it is impossible to resume the
-         * currently executing task. */
-        if( ( pxTCB != pxCurrentTCB ) && ( pxTCB != NULL ) )
-        {
-            taskENTER_CRITICAL();
-            {
-                if( prvTaskIsTaskSuspended( pxTCB ) != pdFALSE )
-                {
-                    traceTASK_RESUME( pxTCB );
-
-                    /* The ready list can be accessed even if the scheduler is
-                     * suspended because this is inside a critical section. */
-                    ( void ) uxListRemove( &( pxTCB->xStateListItem ) );
-                    prvAddTaskToReadyList( pxTCB );
-
-                    /* A higher priority task may have just been resumed. */
-                    if( pxTCB->uxPriority >= pxCurrentTCB->uxPriority )
-                    {
-                        /* This yield may not cause the task just resumed to run,
-                         * but will leave the lists in the correct state for the
-                         * next yield. */
-                        taskYIELD_IF_USING_PREEMPTION();
-                    }
-                    else
-                    {
-                        mtCOVERAGE_TEST_MARKER();
-                    }
-                }
-                else
-                {
-                    mtCOVERAGE_TEST_MARKER();
-                }
-            }
-            taskEXIT_CRITICAL();
+            /* Restore the clobbered interrupt priority register to its original
+             * value. */
+            *pucFirstUserPriorityRegister = ulOriginalPriority;
         }
-        else
-        {
-            mtCOVERAGE_TEST_MARKER();
-        }
-    }
+    #endif /* configASSERT_DEFINED */
+
+    /* Make PendSV and SysTick the lowest priority interrupts. */
+    portNVIC_SHPR3_REG |= portNVIC_PENDSV_PRI;
+
+    portNVIC_SHPR3_REG |= portNVIC_SYSTICK_PRI;
+
+    /* Start the timer that generates the tick ISR.  Interrupts are disabled
+     * here already. */
+    vPortSetupTimerInterrupt();
+
+    /* Initialise the critical nesting count ready for the first task. */
+    uxCriticalNesting = 0;
+
+    /* Start the first task. */
+    prvStartFirstTask();
+
+    /* Should not get here! */
+    return 0;
+}
